@@ -1,0 +1,156 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hand Gesture Demo</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; padding: 0; display:flex; flex-direction:column; align-items:center; }
+      #container { position: relative; width: 640px; }
+      video, canvas { width: 640px; height: 480px; border: 1px solid #ccc; }
+      #status { margin: 8px 0; }
+      #pred { font-size: 1.2rem; font-weight: bold; }
+    </style>
+  </head>
+  <body>
+    <h2>Hand Gesture Demo (client-side MediaPipe)</h2>
+    <div id="container">
+      <video id="video" autoplay muted playsinline></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div id="status">Status: <span id="pred">no prediction</span></div>
+
+    <!-- MediaPipe libs from CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+    <script>
+      const videoElement = document.getElementById('video');
+      const canvasElement = document.getElementById('overlay');
+      const canvasCtx = canvasElement.getContext('2d');
+      const predEl = document.getElementById('pred');
+
+      // Thin wrapper to POST landmarks to server /predict
+      async function postLandmarks(landmarks) {
+        try {
+          const resp = await fetch('/predict', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ landmarks })
+          });
+          if (!resp.ok) {
+            const txt = await resp.text();
+            console.warn('predict error', resp.status, txt);
+            return null;
+          }
+          return await resp.json();
+        } catch (err) {
+          console.warn('predict fetch failed', err);
+          return null;
+        }
+      }
+
+      // Debounce network calls to ~6 FPS
+      let lastSend = 0;
+      const SEND_INTERVAL = 160; // ms
+
+      const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+      });
+      hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.6,
+        minTrackingConfidence: 0.5
+      });
+
+      hands.onResults(async (results) => {
+        // draw
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+          const lm = results.multiHandLandmarks[0];
+          // Draw landmarks
+          drawConnectors(canvasCtx, lm, HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 2 });
+          drawLandmarks(canvasCtx, lm, { color: '#FF0000', lineWidth: 1 });
+
+          // Prepare landmarks as flat list of floats
+          const flat = [];
+          for (const p of lm) { flat.push(p.x, p.y, p.z); }
+
+          const now = performance.now();
+          if (now - lastSend > SEND_INTERVAL) {
+            lastSend = now;
+            const json = await postLandmarks(flat);
+
+            // Simple temporal smoothing / debounce on client side
+            // Maintain a short buffer of recent predictions and only show a gesture
+            // when it appears consistently with sufficient confidence.
+            if (!window._predBuffer) {
+              window._predBuffer = [];
+              window._BUFFER_SIZE = 8; // last N predictions
+              window._CONSISTENT_COUNT = 5; // need this many occurrences
+              window._CONF_THRESH = 0.75; // minimum average probability
+              window._lastTriggered = { label: null, at: 0 };
+              // mapping labels to friendly actions
+              window._ACTIONS = { open: 'Open menu', fist: 'Close menu' };
+            }
+
+            if (json && json.label) {
+              // push entry: {label, prob, t}
+              window._predBuffer.push({ label: json.label, prob: json.probability || 0, t: now });
+              if (window._predBuffer.length > window._BUFFER_SIZE) window._predBuffer.shift();
+
+              // compute counts and average prob per label
+              const counts = {};
+              const probs = {};
+              for (const e of window._predBuffer) {
+                counts[e.label] = (counts[e.label] || 0) + 1;
+                probs[e.label] = (probs[e.label] || 0) + e.prob;
+              }
+              let topLabel = null, topCount = 0;
+              for (const lbl of Object.keys(counts)) {
+                if (counts[lbl] > topCount) { topLabel = lbl; topCount = counts[lbl]; }
+              }
+              const avgProb = topLabel ? (probs[topLabel] / counts[topLabel]) : 0;
+
+              // When stable and confident, consider it a detected gesture
+              let display = 'no prediction';
+              if (topLabel && topCount >= window._CONSISTENT_COUNT && avgProb >= window._CONF_THRESH) {
+                // avoid re-triggering too rapidly
+                const nowMs = performance.now();
+                if (!window._lastTriggered.label || window._lastTriggered.label !== topLabel || (nowMs - window._lastTriggered.at) > 700) {
+                  window._lastTriggered = { label: topLabel, at: nowMs };
+                  // optional action: map to friendly verb
+                  const action = window._ACTIONS[topLabel] || topLabel;
+                  // flash the status briefly
+                  predEl.style.color = '#0a0';
+                  predEl.textContent = `${action} (${(avgProb*100).toFixed(0)}%)`;
+                  setTimeout(() => { predEl.style.color = ''; }, 700);
+                }
+                display = `${topLabel} (${(avgProb*100).toFixed(0)}%)`;
+              } else if (json && json.label) {
+                // show the current best guess but mark as tentative
+                display = `${json.label} ${(json.probability? '(' + (json.probability*100).toFixed(0) + '%)' : '')} • tentative`;
+                predEl.style.color = '';
+              }
+
+              predEl.textContent = display;
+            }
+          }
+        }
+        canvasCtx.restore();
+      });
+
+      // Start camera using MediaPipe Camera class
+      const camera = new Camera(videoElement, {
+        onFrame: async () => { await hands.send({ image: videoElement }); },
+        width: 640,
+        height: 480
+      });
+      camera.start();
+    </script>
+  </body>
+</html>
